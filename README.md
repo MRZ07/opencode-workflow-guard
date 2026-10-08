@@ -10,7 +10,7 @@ Pin the GitHub release in `opencode.json`, as with the cost guard:
 
 ```json
 {
-  "plugin": [["github:MRZ07/opencode-workflow-guard#v0.1.0", {"maxIdenticalFailures": 2}]]
+  "plugin": [["github:MRZ07/opencode-workflow-guard#v0.1.1", {"maxIdenticalFailures": 2}]]
 }
 ```
 
@@ -50,6 +50,9 @@ failure counts. This validates **declared** requirements; the lead remains
 responsible for declaring all applicable gates and interpreting correctness.
 For tasks without applicable command checks, use the existing task report rather
 than manufacturing a check just to obtain a completed checkpoint.
+An actual Cost Guard tool error automatically persists a blocked checkpoint,
+even when the budget guard prevents further checkpoint-tool calls. This stores
+only the blocker category; no additional model request or budget approval.
 
 ## Repetition protection
 

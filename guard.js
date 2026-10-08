@@ -172,7 +172,7 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
       const current = snapshots.get(record.directory);
       const validity = record.exit !== 0 ? 'failed' : !record.stable ? 'changed-during-check' : !current ? 'unavailable' : current.hash !== record.snapshot.hash ? 'stale' : 'pass';
       results.push({ id, criterion: record.criterion, commandHash: record.commandHash, exit: record.exit, startedAt: record.startedAt, endedAt: record.endedAt,
-        validity, snapshotHash: record.snapshot.hash, files: record.snapshot.files, excluded: record.snapshot.excluded });
+        validity, directory: record.directory, snapshotHash: record.snapshot.hash, files: record.snapshot.files, excluded: record.snapshot.excluded });
     }
     return results;
   }
@@ -185,6 +185,13 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
       }
       if (event.type === 'message.part.updated') {
         const part = event.properties?.part;
+        if (part?.type === 'tool' && part.state?.status === 'error' && /^cost-guard:/.test(part.state.error || '') && allowedActor(await roleOf(part.sessionID))) {
+          // Cost Guard can deny checkpoint tools too. Persist the blocked state
+          // from its actual error event without dispatching a tool or model.
+          const root = await rootOf(part.sessionID);
+          await journal(root).put('budget-block:' + part.sessionID + ':' + part.callID,
+            { kind: 'checkpoint', state: 'blocked', root, at: now(), blocker: 'cost-guard', unresolvedCount: null });
+        }
         if (part?.type === 'tool' && ['apply_patch', 'bash'].includes(part.tool) && ['error', 'completed'].includes(part.state?.status)) {
           if (part.tool === 'bash' && !marker(part.state.input?.description)) return;
           // Ignore unrelated actors before any ancestry/API or disk work.

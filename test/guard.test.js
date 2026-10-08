@@ -177,3 +177,17 @@ test('journal replays new external events and enforces explicit capacity', async
   await assert.rejects(a.put('third', { kind: 'test' }), /capacity reached/);
   await a.put('first', { kind: 'test' });
 });
+
+test('an actual budget block saves a checkpoint without a permitted tool invocation', async t => {
+  const f = await fixture(t);
+  const event = { type: 'message.part.updated', properties: { part: {
+    type: 'tool', tool: 'workflow_checkpoint', sessionID: 'child', callID: 'budget',
+    state: { status: 'error', error: 'cost-guard: active budget exceeded. Private message not persisted.' },
+  } } };
+  await f.guard.hooks.event({ event }); await f.guard.hooks.event({ event });
+  const root = (await fs.readdir(f.stateDir))[0];
+  const records = await new Journal(path.join(f.stateDir, root)).records();
+  assert.equal(records.length, 1); assert.equal(records[0].state, 'blocked');
+  assert.equal(records[0].blocker, 'cost-guard'); assert.equal(records[0].unresolvedCount, null);
+  assert.ok(!JSON.stringify(records).includes('Private message'));
+});
