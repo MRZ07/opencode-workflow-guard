@@ -94,7 +94,7 @@ async function patchFingerprint(patch, directory) {
   return hash(JSON.stringify([patch.replace(/\r\n/g, '\n'), states]));
 }
 
-const allowedActor = actor => /^fusion-(planner|code-worker|quick-edit|ops|review-deep|explorer|critic)$/.test(actor || '');
+const allowedActor = actor => actor === 'deep-review' || /^fusion-(planner|code-worker|quick-edit|ops|review-deep|explorer|critic)$/.test(actor || '');
 
 export function createGuard({ client, directory, stateDir, maxIdenticalFailures = 2, now = () => Date.now(), snapshotOptions = {} }) {
   const roles = new Map();

@@ -67,7 +67,7 @@ criteria that this version does not guess from prose.
 
 ## Bounds and limitations
 
-- Only Fusion actors are instrumented; unrelated agents retain their workflow.
+- Fusion actors and `deep-review` are instrumented; unrelated agents retain their workflow.
 - Native permissions still decide whether a tool can execute. Custom tools only
   read verification metadata and write checkpoint metadata, never execute shell.
 - Source snapshots cover regular files, contents and modes; common generated,

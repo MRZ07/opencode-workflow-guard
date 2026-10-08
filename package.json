@@ -1,16 +1,41 @@
 {
   "name": "opencode-workflow-guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Bound repeated failed patches and attest native verification calls in OpenCode workflows.",
   "type": "module",
   "main": "index.js",
-  "exports": { ".": "./index.js" },
-  "files": ["index.js", "guard.js", "README.md", "LICENSE", "test"],
-  "scripts": { "test": "node --test test/*.test.js", "check": "node --check index.js && node --check guard.js", "test:integration": "node test/integration.mjs" },
-  "dependencies": { "zod": "^4.6.5" },
-  "peerDependencies": { "@opencode-ai/plugin": ">=1" },
-  "peerDependenciesMeta": { "@opencode-ai/plugin": { "optional": true } },
-  "engines": { "node": ">=20" },
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "guard.js",
+    "README.md",
+    "LICENSE",
+    "test"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check index.js && node --check guard.js",
+    "test:integration": "node test/integration.mjs"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/MRZ07/opencode-workflow-guard.git" }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MRZ07/opencode-workflow-guard.git"
+  }
 }

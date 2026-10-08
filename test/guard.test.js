@@ -191,3 +191,34 @@ test('an actual budget block saves a checkpoint without a permitted tool invocat
   assert.equal(records[0].blocker, 'cost-guard'); assert.equal(records[0].unresolvedCount, null);
   assert.ok(!JSON.stringify(records).includes('Private message'));
 });
+
+test('standalone Deep Review budget errors persist once while unrelated actors stay untouched', async t => {
+  const f = await fixture(t);
+  await f.guard.hooks['chat.params']({ sessionID: 'root', agent: 'deep-review' });
+  await f.guard.hooks['chat.params']({ sessionID: 'other', agent: 'build' });
+  const eventFor = sessionID => ({ type: 'message.part.updated', properties: { part: {
+    type: 'tool', tool: 'read', sessionID, callID: 'budget',
+    state: { status: 'error', error: 'cost-guard: active budget exceeded. Private details.' },
+  } } });
+  await f.guard.hooks.event({ event: eventFor('other') });
+  await assert.rejects(fs.access(f.stateDir), { code: 'ENOENT' });
+  await f.guard.hooks.event({ event: eventFor('root') });
+  await f.guard.hooks.event({ event: eventFor('root') });
+  const root = (await fs.readdir(f.stateDir))[0];
+  const records = await new Journal(path.join(f.stateDir, root)).records();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].root, 'root');
+  assert.equal(records[0].blocker, 'cost-guard');
+  assert.ok(!JSON.stringify(records).includes('Private details'));
+});
+
+test('Deep Review evidence helpers and dispatches share the standalone review root', async t => {
+  const f = await fixture(t);
+  await f.guard.hooks['chat.params']({ sessionID: 'root', agent: 'deep-review' });
+  await f.guard.hooks['tool.execute.before']({ tool: 'task', sessionID: 'root', callID: 'ops' }, { args: {} });
+  const input = await verifyBefore(f.guard);
+  const id = await verifyAfter(f.guard, input);
+  const report = await f.guard.checkpoint('root', 'completed', [id]);
+  assert.equal(report.dispatches, 1);
+  assert.equal(report.evidence[0].validity, 'pass');
+});

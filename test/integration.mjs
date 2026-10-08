@@ -13,6 +13,8 @@ await fs.writeFile(path.join(project, 'source.js'), 'old\n');
 spawnSync('git', ['init', '-q', project]);
 const seen = [];
 const costMode = !!process.env.WORKFLOW_GUARD_COST_PLUGIN_PATH;
+const actor = process.env.WORKFLOW_GUARD_TEST_AGENT || 'fusion-planner';
+assert.ok(['fusion-planner', 'deep-review'].includes(actor), 'Unsupported integration actor');
 let step = 0;
 let evidenceID;
 const server = createServer(async (req, res) => {
@@ -36,8 +38,8 @@ const server = createServer(async (req, res) => {
     if (step === 8) { tool = 'workflow_checkpoint'; args = { state: 'completed', required: [evidenceID], unresolvedCount: 0 }; }
     if (step === 9) { tool = 'workflow_checkpoint'; args = { state: 'blocked', required: [evidenceID], unresolvedCount: 1 }; }
     if (costMode) {
-      tool = step <= 2 ? 'bash' : undefined;
-      args = { command: 'node -e "process.exit(0)"', description: 'verify:budget Check blocked budget', timeout: 10000 };
+      tool = step <= 2 ? 'read' : undefined;
+      args = { filePath: path.join(project, 'source.js') };
     }
   }
   const delta = tool ? { tool_calls: [{ index: 0, id: 'call_' + step, type: 'function', function: { name: tool, arguments: JSON.stringify(args) } }] } : { content: 'Integration complete' };
@@ -53,20 +55,27 @@ const configRoot = path.join(temp, 'config');
 await fs.mkdir(path.join(configRoot, 'opencode'), { recursive: true });
 const config = {
   plugin: [pathToFileURL(process.env.WORKFLOW_GUARD_PLUGIN_PATH || path.join(repo, 'index.js')).href],
-  model: 'workflow_test/gpt-6.1', small_model: 'workflow_test/gpt-6.1', default_agent: 'fusion-planner', autoupdate: false,
+  model: 'workflow_test/gpt-6.1', small_model: 'workflow_test/gpt-6.1', default_agent: actor, autoupdate: false,
   lsp: false, formatter: false, permission: { '*': 'allow' },
-  agent: { 'fusion-planner': { mode: 'primary', permission: { '*': 'allow' }, prompt: 'Execute the deterministic integration tool sequence.' } },
+  agent: { [actor]: { mode: 'primary', permission: { '*': 'allow' }, prompt: 'Execute the deterministic integration tool sequence.' } },
   provider: { workflow_test: { npm: '@ai-sdk/openai-compatible', name: 'Workflow test', options: { baseURL: 'http://127.0.0.1:' + server.address().port + '/v1', apiKey: 'local-test-only' }, models: { 'gpt-6.1': { name: 'gpt-6.1', limit: { context: 128000, output: 8192 }, tool_call: true } } } },
 };
-if (costMode) config.plugin.push([pathToFileURL(process.env.WORKFLOW_GUARD_COST_PLUGIN_PATH).href, { action: 'block', onBlock: 'ask', tokenLimit: 1, persist: false }]);
+if (costMode) {
+  const guard = [pathToFileURL(process.env.WORKFLOW_GUARD_COST_PLUGIN_PATH).href, { action: 'block', onBlock: 'ask', tokenLimit: 1, persist: false }];
+  if (process.env.WORKFLOW_GUARD_TEST_REVERSE_ORDER) config.plugin.push(guard);
+  else config.plugin.unshift(guard); // Match the live Cost Guard -> Workflow Guard order.
+}
 await fs.writeFile(path.join(configRoot, 'opencode', 'opencode.json'), JSON.stringify(config));
 const env = { ...process.env, XDG_CONFIG_HOME: configRoot, XDG_DATA_HOME: path.join(temp, 'data'), XDG_CACHE_HOME: path.join(temp, 'cache'), XDG_STATE_HOME: path.join(temp, 'state'), OPENCODE_CONFIG_DIR: path.join(configRoot, 'opencode') };
 delete env.OPENCODE_CONFIG; delete env.OPENCODE_CONFIG_CONTENT;
+delete env.OPENCODE_COST_GUARD_ACTION; delete env.OPENCODE_COST_GUARD_LIMIT;
+env.OPENCODE_COST_GUARD_CONFIG = path.join(configRoot, 'budget.json');
+await fs.writeFile(env.OPENCODE_COST_GUARD_CONFIG, '{}');
 const resolved = spawnSync('opencode', ['debug', 'config'], { cwd: project, env, encoding: 'utf8', timeout: 30000 });
 if (resolved.status !== 0) throw new Error('Isolated config failed: ' + resolved.stderr.slice(-1000));
 const parsed = JSON.parse(resolved.stdout);
 assert.equal(parsed.plugin.length, costMode ? 2 : 1, 'Integration must not load live user plugins');
-const child = spawn('opencode', ['run', '--dir', project, '--format', 'json', '--agent', 'fusion-planner', 'WORKFLOW_GUARD_INTEGRATION'], { cwd: project, env, stdio: ['ignore', 'pipe', 'pipe'] });
+const child = spawn('opencode', ['run', '--dir', project, '--format', 'json', '--agent', actor, 'WORKFLOW_GUARD_INTEGRATION'], { cwd: project, env, stdio: ['ignore', 'pipe', 'pipe'] });
 let output = ''; let errors = '';
 child.stdout.on('data', chunk => { output += chunk; });
 child.stderr.on('data', chunk => { errors += chunk; });
@@ -87,7 +96,7 @@ try {
     }
     await walk(state);
     assert.ok(records.some(r => r.kind === 'checkpoint' && r.state === 'blocked' && r.blocker === 'cost-guard'), 'Actual budget error did not persist the blocked checkpoint');
-    console.log('Native cost-guard integration passed: blocked checkpoint saved without another tool call.');
+    console.log(`Native cost-guard integration passed (${actor}): blocked checkpoint saved without another tool call.`);
   } else {
   assert.ok(seen.some(s => s.includes('identical patch already failed 2')), 'Native failed-tool event repetition guard did not fire');
   assert.ok(seen.some(s => s.includes('"validity":"pass"')), 'Native check was not attested');
