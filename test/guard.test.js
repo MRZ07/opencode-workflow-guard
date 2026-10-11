@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { createGuard, Journal, snapshot } from '../guard.js';
 
 async function fixture(t) {
@@ -221,4 +222,65 @@ test('Deep Review evidence helpers and dispatches share the standalone review ro
   const report = await f.guard.checkpoint('root', 'completed', [id]);
   assert.equal(report.dispatches, 1);
   assert.equal(report.evidence[0].validity, 'pass');
+});
+
+test('prepared sibling Git worktree survives restart without granting unrelated directory access', async t => {
+  const f = await fixture(t);
+  const run = args => execFileSync('git', args, { cwd: f.directory, stdio: 'pipe' });
+  run(['init', '-q']); run(['add', 'source.js']);
+  run(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture']);
+  const sibling = path.join(path.dirname(f.directory), 'selected');
+  run(['worktree', 'add', '-q', '-b', 'selected', sibling]);
+  await assert.rejects(verifyBefore(f.guard, 'unbound', { workdir: sibling }), /prepare.*worktree/);
+  const prepared = await f.guard.prepare('root', sibling, [{ criterion: 'unit', command: 'npm test' }]);
+  assert.equal(prepared.runtime.version, '0.2.0');
+  const restarted = createGuard(f);
+  await restarted.hooks['chat.params']({ sessionID: 'child', agent: 'fusion-code-worker' });
+  const input = await verifyBefore(restarted, 'selected', { workdir: sibling });
+  const id = await verifyAfter(restarted, input);
+  assert.equal((await restarted.evidence('root', [id]))[0].directory, await fs.realpath(sibling));
+  await assert.rejects(f.guard.prepare('child', sibling, []), /primary root/);
+  const unrelated = path.join(path.dirname(f.directory), 'unrelated');
+  await fs.mkdir(unrelated); execFileSync('git', ['init', '-q', unrelated]);
+  await assert.rejects(f.guard.prepare('root', unrelated, []), /another repository/);
+  await assert.rejects(verifyBefore(restarted, 'outside', { workdir: unrelated }), /inside this worktree/);
+});
+
+test('only exact declared acceptance commands acquire a native marker', async t => {
+  const f = await fixture(t);
+  await f.guard.prepare('root', f.directory, [{ criterion: 'unit', command: 'npm test' }]);
+  const input = { tool: 'bash', sessionID: 'child', callID: 'declared', args: { command: 'npm test', description: 'Run focused tests', workdir: f.directory } };
+  await f.guard.hooks['tool.execute.before'](input, { args: input.args });
+  assert.match(input.args.description, /^verify:unit /);
+  const id = await verifyAfter(f.guard, input);
+  assert.equal((await f.guard.evidence('root', [id]))[0].validity, 'pass');
+  const ordinary = { tool: 'bash', sessionID: 'child', callID: 'formatter', args: { command: 'npm run fix', description: 'Format owned changes' } };
+  await f.guard.hooks['tool.execute.before'](ordinary, { args: ordinary.args });
+  assert.equal(ordinary.args.description, 'Format owned changes');
+  await assert.rejects(verifyBefore(f.guard, 'weaker', { command: 'true' }), /differs from the declared criterion/);
+});
+
+test('three distinct failed snapshots require primary diagnosis across resumes and new helpers', async t => {
+  const f = await fixture(t);
+  for (let n = 0; n < 3; n++) {
+    await fs.writeFile(path.join(f.directory, 'source.js'), 'fix ' + n);
+    await verifyAfter(f.guard, await verifyBefore(f.guard, 'fail-' + n), 1);
+  }
+  const restarted = createGuard(f);
+  await restarted.hooks['chat.params']({ sessionID: 'child', agent: 'fusion-code-worker' });
+  await assert.rejects(verifyBefore(restarted, 'fourth'), /3 distinct input snapshots/);
+  await restarted.hooks['tool.execute.before']({ tool: 'read', sessionID: 'child', callID: 'diagnosis-read' }, { args: {} });
+  await restarted.prepare('root', f.directory, [{ criterion: 'unit', command: 'npm test' }], { criterion: 'unit', hypothesis: 'Fixture owns the missing dependency', exitCondition: 'One focused correction, then return' }, 'diagnosis');
+  const id = await verifyAfter(restarted, await verifyBefore(restarted, 'recovered'));
+  assert.equal((await restarted.evidence('root', [id]))[0].validity, 'pass');
+});
+
+test('unchanged checks count one failing input and criteria remain independent', async t => {
+  const f = await fixture(t);
+  for (let n = 0; n < 4; n++) await verifyAfter(f.guard, await verifyBefore(f.guard, 'same-' + n), 1);
+  await fs.writeFile(path.join(f.directory, 'source.js'), 'second fix');
+  await verifyAfter(f.guard, await verifyBefore(f.guard, 'changed'), 1);
+  const independent = await verifyBefore(f.guard, 'other-criterion', { description: 'verify:compile Compile only' });
+  await verifyAfter(f.guard, independent, 0);
+  await assert.rejects(f.guard.prepare('root', f.directory, [], { criterion: 'unknown', hypothesis: 'Unknown', exitCondition: 'Stop' }, 'bad'), /declared criterion/);
 });

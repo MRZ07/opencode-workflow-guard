@@ -11,6 +11,12 @@ const project = path.join(temp, 'project');
 await fs.mkdir(project);
 await fs.writeFile(path.join(project, 'source.js'), 'old\n');
 spawnSync('git', ['init', '-q', project]);
+for (const args of [['add', 'source.js'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture']]) {
+  assert.equal(spawnSync('git', args, { cwd: project }).status, 0);
+}
+const selected = path.join(temp, 'selected');
+assert.equal(spawnSync('git', ['worktree', 'add', '-q', '-b', 'selected', selected], { cwd: project }).status, 0);
+
 const seen = [];
 const costMode = !!process.env.WORKFLOW_GUARD_COST_PLUGIN_PATH;
 const actor = process.env.WORKFLOW_GUARD_TEST_AGENT || 'fusion-planner';
@@ -31,12 +37,13 @@ const server = createServer(async (req, res) => {
     step++;
     const badPatch = '*** Begin Patch\n*** Update File: source.js\n@@\n-missing\n+new\n*** End Patch';
     if (step <= 3) { tool = 'apply_patch'; args = { patchText: badPatch }; }
-    if (step === 4) { tool = 'bash'; args = { command: 'node -e "process.exit(0)"', description: 'verify:unit Check deterministic exit', timeout: 10000 }; }
-    if (step === 5) { tool = 'workflow_evidence'; args = { ids: [evidenceID] }; }
-    if (step === 6) { tool = 'bash'; args = { command: 'node -e "require(\'fs\').appendFileSync(\'source.js\', \'changed\\n\')"', description: 'Mutate owned integration fixture', timeout: 10000 }; }
-    if (step === 7) { tool = 'workflow_evidence'; args = { ids: [evidenceID] }; }
-    if (step === 8) { tool = 'workflow_checkpoint'; args = { state: 'completed', required: [evidenceID], unresolvedCount: 0 }; }
-    if (step === 9) { tool = 'workflow_checkpoint'; args = { state: 'blocked', required: [evidenceID], unresolvedCount: 1 }; }
+    if (step === 4) { tool = 'workflow_prepare'; args = { workdir: selected, checks: [{ criterion: 'unit', command: 'node -e "process.exit(0)"' }] }; }
+    if (step === 5) { tool = 'bash'; args = { command: 'node -e "process.exit(0)"', workdir: selected, description: 'Run declared check', timeout: 10000 }; }
+    if (step === 6) { tool = 'workflow_evidence'; args = { ids: [evidenceID] }; }
+    if (step === 7) { tool = 'bash'; args = { command: 'node -e "require(\'fs\').appendFileSync(\'source.js\', \'changed\\n\')"', workdir: selected, description: 'Mutate owned integration fixture', timeout: 10000 }; }
+    if (step === 8) { tool = 'workflow_evidence'; args = { ids: [evidenceID] }; }
+    if (step === 9) { tool = 'workflow_checkpoint'; args = { state: 'completed', required: [evidenceID], unresolvedCount: 0 }; }
+    if (step === 10) { tool = 'workflow_checkpoint'; args = { state: 'blocked', required: [evidenceID], unresolvedCount: 1 }; }
     if (costMode) {
       tool = step <= 2 ? 'read' : undefined;
       args = { filePath: path.join(project, 'source.js') };
@@ -103,9 +110,10 @@ try {
   assert.ok(seen.some(s => s.includes('"validity":"stale"')), 'Changed bytes did not invalidate evidence');
   assert.ok(seen.some(s => s.includes('completion requires')), 'Stale completion was not blocked');
   assert.ok(seen.some(s => s.includes('"state":"blocked"')), 'Blocked checkpoint missing');
-  assert.equal(await fs.readFile(path.join(project, 'source.js'), 'utf8'), 'old\nchanged\n', 'Native command must mutate only the owned fixture');
+  assert.equal(await fs.readFile(path.join(selected, 'source.js'), 'utf8'), 'old\nchanged\n', 'Native command must mutate only the selected worktree fixture');
+  assert.equal(await fs.readFile(path.join(project, 'source.js'), 'utf8'), 'old\n', 'Original repository must remain unchanged');
   const attestation = JSON.parse(seen.find(s => s.startsWith('[{') && s.includes('"validity":"pass"')))[0];
-  assert.equal(attestation.directory, await fs.realpath(project), 'Evidence must identify the exact owned worktree');
+  assert.equal(attestation.directory, await fs.realpath(selected), 'Evidence must identify the exact selected worktree');
   console.log('Native OpenCode integration passed: repeat blocked, check attested, stale evidence rejected, checkpoint saved.');
   }
 } catch (error) {

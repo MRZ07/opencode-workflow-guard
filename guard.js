@@ -1,7 +1,12 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const git = promisify(execFile);
+export const VERSION = '0.2.0';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const excluded = new Set(['.git', '.hg', '.svn', 'node_modules', 'dist', 'build', 'target', 'coverage', '.cache', '.next', '.nuxt', '.turbo', 'screenshots', 'videos']);
@@ -12,9 +17,11 @@ const marker = description => /^verify:([A-Za-z0-9][A-Za-z0-9._-]{0,79})(?:\s|$)
 // Store hashes and bounded metadata, never command output, patch text or source.
 export class Journal {
   constructor(directory, limit = 10000) { this.directory = directory; this.limit = limit; this.cache = new Map(); }
-  async records() {
-    await fs.mkdir(this.directory, { recursive: true, mode: 0o700 });
-    const names = (await fs.readdir(this.directory)).filter(n => /^[a-f0-9]{64}\.json$/.test(n));
+  async records(create = true) {
+    if (create) await fs.mkdir(this.directory, { recursive: true, mode: 0o700 });
+    let files;
+    try { files = await fs.readdir(this.directory); } catch (error) { if (!create && error.code === 'ENOENT') return []; throw error; }
+    const names = files.filter(n => /^[a-f0-9]{64}\.json$/.test(n));
     if (names.length > this.limit) throw new Error('workflow-guard: journal capacity exceeded; preserve the checkpoint and inspect storage');
     await Promise.all(names.filter(name => !this.cache.has(name)).map(async name => {
       const value = JSON.parse(await fs.readFile(path.join(this.directory, name), 'utf8'));
@@ -96,11 +103,12 @@ async function patchFingerprint(patch, directory) {
 
 const allowedActor = actor => actor === 'deep-review' || /^fusion-(planner|code-worker|quick-edit|ops|review-deep|explorer|critic)$/.test(actor || '');
 
-export function createGuard({ client, directory, stateDir, maxIdenticalFailures = 2, now = () => Date.now(), snapshotOptions = {} }) {
+export function createGuard({ client, directory, stateDir, maxIdenticalFailures = 2, maxFailedChecks = 3, now = () => Date.now(), snapshotOptions = {} }) {
   const roles = new Map();
   const roots = new Map();
   const journals = new Map();
   const rootDirectory = path.resolve(directory);
+  const runtime = { version: VERSION, optionsHash: hash(JSON.stringify({ maxIdenticalFailures, maxFailedChecks })).slice(0, 16) };
   const storage = stateDir || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'opencode', 'workflow-guard', hash(rootDirectory));
   const journal = root => {
     if (!journals.has(root)) journals.set(root, new Journal(path.join(storage, hash(root))));
@@ -131,12 +139,57 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
     return roles.get(sessionID);
   };
   const snap = cwd => snapshot(cwd, snapshotOptions);
-  const scopedDirectory = async value => {
+  const scopedDirectory = async (value, root) => {
     const cwd = await fs.realpath(path.resolve(rootDirectory, value || '.'));
     const base = await fs.realpath(rootDirectory);
-    if (!within(base, cwd)) throw new Error('workflow-guard: marked verification must run inside this worktree');
+    const bindings = (await journal(root).records()).filter(r => r.kind === 'binding');
+    if (!within(base, cwd) && !bindings.some(r => within(r.directory, cwd))) throw new Error('workflow-guard: marked verification must run inside this worktree; the primary must prepare the selected Git worktree first');
     return cwd;
   };
+  async function prepare(sessionID, workdir, checks, diagnosis, callID) {
+    const root = await rootOf(sessionID);
+    if (root !== sessionID) throw new Error('workflow-guard: only the primary root may prepare a run');
+    const cwd = await fs.realpath(path.resolve(rootDirectory, workdir));
+    const base = await fs.realpath(rootDirectory);
+    if (!within(base, cwd)) {
+      const common = async dir => {
+        const { stdout } = await git('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { timeout: 10000, maxBuffer: 4096 });
+        return fs.realpath(stdout.trim());
+      };
+      if (await common(base) !== await common(cwd)) throw new Error('workflow-guard: selected worktree belongs to another repository');
+      const { stdout } = await git('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { timeout: 10000, maxBuffer: 4096 });
+      if (await fs.realpath(stdout.trim()) !== cwd) throw new Error('workflow-guard: select the Git worktree root');
+    }
+    const store = journal(root);
+    const records = await store.records();
+    if (new Set(checks.map(c => c.criterion)).size !== checks.length) throw new Error('workflow-guard: duplicate check criterion');
+    if (new Set(checks.map(c => c.command)).size !== checks.length) throw new Error('workflow-guard: command must have one criterion');
+    if (diagnosis && !checks.some(c => c.criterion === diagnosis.criterion) && !records.some(r => r.kind === 'check' && r.directory === cwd && r.criterion === diagnosis.criterion)) throw new Error('workflow-guard: diagnosis requires a declared criterion');
+    for (const check of checks) {
+      const commandHash = hash(check.command);
+      const prior = records.find(r => r.kind === 'check' && r.directory === cwd && r.commandHash === commandHash);
+      if (prior && prior.criterion !== check.criterion) throw new Error('workflow-guard: command already belongs to another criterion');
+    }
+    await store.put('binding:' + cwd, { kind: 'binding', directory: cwd, at: now(), runtime });
+    for (const check of checks) {
+      const commandHash = hash(check.command);
+      await store.put('check:' + cwd + ':' + check.criterion + ':' + commandHash, { kind: 'check', directory: cwd, criterion: check.criterion, commandHash });
+    }
+    if (diagnosis) await store.put('diagnosis:' + sessionID + ':' + (callID || randomUUID()), {
+      kind: 'diagnosis', directory: cwd, criterion: diagnosis.criterion,
+      hypothesisHash: hash(diagnosis.hypothesis), exitConditionHash: hash(diagnosis.exitCondition), at: now(),
+    });
+    return { directory: cwd, checks: checks.map(c => c.criterion), diagnosticCriterion: diagnosis?.criterion || null, maxFailedChecks, runtime };
+  }
+  function failures(records, directory, criterion) {
+    let count = 0;
+    const seen = new Set();
+    for (const r of records.filter(r => r.directory === directory && r.criterion === criterion).sort((a, b) => (a.startedAt ?? a.at ?? 0) - (b.startedAt ?? b.at ?? 0))) {
+      if (r.kind === 'diagnosis' || (r.kind === 'outcome' && r.exit === 0 && r.stable)) { count = 0; seen.clear(); }
+      else if (r.kind === 'outcome' && Number.isInteger(r.exit) && r.exit !== 0 && r.stable && !seen.has(r.snapshot.hash)) { seen.add(r.snapshot.hash); count++; }
+    }
+    return count;
+  }
   async function complete(input, state) {
     if (!input.sessionID || !input.callID) return;
     const root = await rootOf(input.sessionID);
@@ -202,8 +255,16 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
     },
     'tool.execute.before': async (input, output) => {
       if (!['apply_patch', 'bash', 'task'].includes(input.tool) || !allowedActor(await roleOf(input.sessionID))) return;
-      const criterion = input.tool === 'bash' && marker(output.args.description);
-      if (input.tool === 'bash' && !criterion) return;
+      let criterion = input.tool === 'bash' && marker(output.args.description);
+      if (input.tool === 'bash' && !criterion) {
+        // Only explicitly registered checks are promoted; ordinary commands stay untouched.
+        const root = await rootOf(input.sessionID);
+        const cwd = await fs.realpath(path.resolve(rootDirectory, output.args.workdir || '.'));
+        const declared = (await journal(root).records(false)).find(r => r.kind === 'check' && r.directory === cwd && r.commandHash === hash(output.args.command || ''));
+        if (!declared) return;
+        criterion = declared.criterion;
+        output.args.description = 'verify:' + criterion + ' Declared acceptance check';
+      }
       const root = await rootOf(input.sessionID);
       const store = journal(root);
       if (input.tool === 'task') {
@@ -214,12 +275,22 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
       if (input.tool === 'apply_patch') {
         const patch = output.args.patchText;
         if (typeof patch !== 'string') return;
-        record.patchKey = await patchFingerprint(patch, await fs.realpath(rootDirectory));
+        // Fingerprint only files inside the original or explicitly bound checkout.
+        const records = await store.records();
+        const base = await fs.realpath(rootDirectory);
+        const paths = patchPaths(patch, base);
+        const binding = records.find(r => r.kind === 'binding' && paths.length && paths.every(file => within(r.directory, file)));
+        record.patchKey = await patchFingerprint(patch, binding?.directory || base);
         if (!record.patchKey) return;
         const failures = (await store.records()).filter(r => r.kind === 'outcome' && r.patchKey === record.patchKey && r.failed).length;
         if (failures >= maxIdenticalFailures) throw new Error('workflow-guard: identical patch already failed ' + failures + ' times against unchanged inputs. Read the current owner block and revise the patch; a fresh helper does not reset this guard. Diagnostic tools remain available.');
       } else {
-        const cwd = await scopedDirectory(output.args.workdir);
+        const cwd = await scopedDirectory(output.args.workdir, root);
+        const records = await store.records();
+        const declared = records.filter(r => r.kind === 'check' && r.directory === cwd && r.criterion === criterion);
+        if (declared.length && !declared.some(r => r.commandHash === hash(output.args.command || ''))) throw new Error('workflow-guard: command differs from the declared criterion; return the change to the primary');
+        const count = failures(records, cwd, criterion);
+        if (count >= maxFailedChecks) throw new Error(`workflow-guard: ${criterion} failed on ${count} distinct input snapshots. Return the last failure and hypothesis to the primary; it must prepare a bounded diagnosis before more checks. Reads remain available; a fresh helper does not reset this boundary.`);
         record.directory = cwd;
         record.criterion = criterion;
         record.commandHash = hash(output.args.command || '');
@@ -236,7 +307,8 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
         const root = await rootOf(input.sessionID);
         const record = (await journal(root).records()).find(r => r.kind === 'outcome' && r.sessionID === input.sessionID && r.callID === input.callID && r.evidenceID);
         if (record) {
-          const summary = { evidenceID: record.evidenceID, criterion: record.criterion, exit: record.exit, stable: record.stable };
+          const summary = { evidenceID: record.evidenceID, criterion: record.criterion, exit: record.exit, stable: record.stable,
+            failedChecks: failures(await journal(root).records(), record.directory, record.criterion), runtime };
           output.metadata = { ...output.metadata, workflowGuard: summary };
           output.output += '\n[workflow-guard] ' + JSON.stringify(summary);
         }
@@ -248,10 +320,10 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
     const results = await evidence(sessionID, required);
     if (state === 'completed' && (!required.length || unresolvedCount || results.some(r => r.validity !== 'pass'))) throw new Error('workflow-guard: completion requires declared evidence passing on current inputs and zero unresolved items. Save a blocked checkpoint instead.');
     const records = await journal(root).records();
-    const report = { state, root, at: now(), unresolvedCount, evidence: results, dispatches: records.filter(r => r.kind === 'dispatch').length,
+    const report = { state, root, at: now(), runtime, unresolvedCount, evidence: results, dispatches: records.filter(r => r.kind === 'dispatch').length,
       patchFailures: records.filter(r => r.kind === 'outcome' && r.tool === 'apply_patch' && r.failed).length };
     await journal(root).put('checkpoint:' + hash(JSON.stringify(report)), { kind: 'checkpoint', ...report });
     return report;
   }
-  return { hooks, evidence, checkpoint, rootOf };
+  return { hooks, evidence, checkpoint, prepare, rootOf };
 }

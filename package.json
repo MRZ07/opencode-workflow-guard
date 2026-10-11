@@ -1,6 +1,6 @@
 {
   "name": "opencode-workflow-guard",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Bound repeated failed patches and attest native verification calls in OpenCode workflows.",
   "type": "module",
   "main": "index.js",

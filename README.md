@@ -2,7 +2,8 @@
 
 Small OpenCode guard for Fusion: bound identical failed patches, record native
 verification evidence, and persist blocked/completed checkpoints. No additional
-model requests, command execution, billing logic or permission grants.
+model requests, check execution, billing logic or permission grants. Worktree
+registration performs bounded read-only Git identity queries.
 
 ## Install
 
@@ -10,12 +11,34 @@ Pin the GitHub release in `opencode.json`, as with the cost guard:
 
 ```json
 {
-  "plugin": [["github:MRZ07/opencode-workflow-guard#v0.1.1", {"maxIdenticalFailures": 2}]]
+  "plugin": [["github:MRZ07/opencode-workflow-guard#v0.2.0", {"maxIdenticalFailures": 2}]]
 }
 ```
 
 Load it in a new OpenCode instance. Existing sessions/processes do not receive
 new hooks automatically. Keep the cost guard for financial/token limits.
+
+## Run preparation
+
+The primary `fusion-planner` or standalone `deep-review` calls `workflow_prepare`
+with the Ops-verified absolute `workdir` and `checks: [{criterion, command}]`.
+Only exact declared commands receive automatic native markers; arbitrary commands
+remain ordinary. Register non-mutating checks, never formatters or installs.
+Sibling Git worktrees must have the same Git common directory. Unrelated external
+repositories are rejected; bindings survive helper resumes and server restarts.
+
+After `maxFailedChecks` distinct failing input snapshots per criterion (default 3,
+configurable 1–10), further checks require a primary diagnosis. Reads remain
+available. The helper returns its failure/hypothesis; the primary registers
+`diagnosis: {criterion, hypothesis, exitCondition}` and resumes that same helper.
+This resets the diagnostic window, preserves historical failures and never
+extends a Cost Guard budget. A passing stable check resets the window. Repeated
+checks of the same failing bytes count once; tool errors/unknown exits do not
+count as failed fixes. The guard measures snapshots, not semantic fix cycles.
+
+Runtime version and option fingerprints accompany preparation, native results
+and checkpoints. No source, commands, check logs or diagnostic text are stored
+in the journal; it stores hashes and bounded metadata only.
 
 ## Native verification
 
@@ -25,6 +48,7 @@ Use native `bash` with a stable criterion in its description:
 {
   "command": "pnpm test:vitest:run",
   "description": "verify:unit Run required unit tests",
+  "workdir": "/absolute/selected/worktree",
   "timeout": 600000
 }
 ```
