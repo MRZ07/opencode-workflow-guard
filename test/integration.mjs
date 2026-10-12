@@ -78,18 +78,42 @@ delete env.OPENCODE_CONFIG; delete env.OPENCODE_CONFIG_CONTENT;
 delete env.OPENCODE_COST_GUARD_ACTION; delete env.OPENCODE_COST_GUARD_LIMIT;
 env.OPENCODE_COST_GUARD_CONFIG = path.join(configRoot, 'budget.json');
 await fs.writeFile(env.OPENCODE_COST_GUARD_CONFIG, '{}');
-const resolved = spawnSync('opencode', ['debug', 'config'], { cwd: project, env, encoding: 'utf8', timeout: 30000 });
-if (resolved.status !== 0) throw new Error('Isolated config failed: ' + resolved.stderr.slice(-1000));
-const parsed = JSON.parse(resolved.stdout);
-assert.equal(parsed.plugin.length, costMode ? 2 : 1, 'Integration must not load live user plugins');
-const child = spawn('opencode', ['run', '--dir', project, '--format', 'json', '--agent', actor, 'WORKFLOW_GUARD_INTEGRATION'], { cwd: project, env, stdio: ['ignore', 'pipe', 'pipe'] });
-let output = ''; let errors = '';
-child.stdout.on('data', chunk => { output += chunk; });
-child.stderr.on('data', chunk => { errors += chunk; });
-const timer = setTimeout(() => child.kill('SIGTERM'), 80000);
+// Use an owned server: newer CLIs resolve `debug config` through a shared service.
+const reserve = createServer();
+await new Promise(resolve => reserve.listen(0, '127.0.0.1', resolve));
+const port = reserve.address().port;
+await new Promise(resolve => reserve.close(resolve));
+const host = spawn(process.env.OPENCODE_BIN || 'opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
+  { cwd: project, env, stdio: ['ignore', 'pipe', 'pipe'] });
+let hostErrors = '';
+host.stderr.on('data', chunk => { hostErrors += chunk; });
+host.stdout.resume();
+const baseURL = `http://127.0.0.1:${port}`;
+const api = async (route, method = 'GET', body) => {
+  const response = await fetch(baseURL + route + '?directory=' + encodeURIComponent(project),
+    { method, headers: { 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(method === 'POST' ? 80000 : 5000) });
+  assert.ok(response.ok, `Owned server ${route}: ${response.status}`);
+  assert.match(response.headers.get('content-type') || '', /application\/json/, 'This integration requires the native plugin server API (/global/health, /config); choose its executable with OPENCODE_BIN');
+  return response.json();
+};
+let output = '';
 try {
-  const code = await new Promise(resolve => child.on('close', resolve));
-  assert.equal(code, 0, errors.slice(-1000));
+  const deadline = Date.now() + 45000;
+  while (true) {
+    try { await api('/global/health'); break; }
+    catch (error) {
+      if (error.code === 'ERR_ASSERTION') throw error;
+      if (Date.now() >= deadline || host.exitCode != null) throw new Error(hostErrors.slice(-1000) || error.message);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  const parsed = await api('/config');
+  assert.deepEqual(parsed.plugin, config.plugin, 'Integration must load only the exact owned-fixture plugins');
+  const session = await api('/session', 'POST', {});
+  const result = await api(`/session/${session.id}/message`, 'POST', {
+    agent: actor, parts: [{ type: 'text', text: 'WORKFLOW_GUARD_INTEGRATION' }],
+  });
+  output = JSON.stringify(result);
   if (costMode) {
     assert.ok(seen.some(s => s.includes('cost-guard:')), 'Real cost guard did not block the native call');
     const state = path.join(temp, 'state', 'opencode', 'workflow-guard');
@@ -117,9 +141,11 @@ try {
   console.log('Native OpenCode integration passed: repeat blocked, check attested, stale evidence rejected, checkpoint saved.');
   }
 } catch (error) {
-  await fs.writeFile(path.join(temp, 'diagnostic.json'), JSON.stringify({ step, seen, output, errors }, null, 2));
+  await fs.writeFile(path.join(temp, 'diagnostic.json'), JSON.stringify({ step, seen, output, errors: hostErrors }, null, 2));
   console.error('Owned-fixture diagnostics:', path.join(temp, 'diagnostic.json'));
   throw error;
 } finally {
-  clearTimeout(timer); child.kill('SIGTERM'); server.close();
+  host.kill('SIGTERM');
+  if (host.exitCode == null && host.signalCode == null) await new Promise(resolve => host.once('close', resolve));
+  await new Promise(resolve => server.close(resolve));
 }

@@ -1,13 +1,20 @@
 import { z } from 'zod';
 import { createGuard } from './guard.js';
+import { snapshotLimits } from './snapshot.js';
 
 export const WorkflowGuard = async ({ client, directory, worktree }, options = {}) => {
   const maxIdenticalFailures = options.maxIdenticalFailures ?? 2;
   const maxFailedChecks = options.maxFailedChecks ?? 3;
   if (!Number.isInteger(maxIdenticalFailures) || maxIdenticalFailures < 1 || maxIdenticalFailures > 10) throw new Error('workflow-guard: maxIdenticalFailures must be an integer from 1 to 10');
   if (!Number.isInteger(maxFailedChecks) || maxFailedChecks < 1 || maxFailedChecks > 10) throw new Error('workflow-guard: maxFailedChecks must be an integer from 1 to 10');
+  const snapshotOptions = snapshotLimits(z.object({
+    maxBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    maxFiles: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    maxEntries: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    maxDurationMs: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  }).strict().parse(options.snapshot ?? {}));
   const cwd = typeof directory === 'string' ? directory : directory?.worktree || worktree || process.cwd();
-  const guard = createGuard({ client, directory: cwd, maxIdenticalFailures, maxFailedChecks });
+  const guard = createGuard({ client, directory: cwd, maxIdenticalFailures, maxFailedChecks, snapshotOptions });
   const ids = z.array(z.string().regex(/^wg_[a-f0-9]{24}$/)).max(20);
   const criterion = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/);
   const owner = async context => {
@@ -29,14 +36,14 @@ export const WorkflowGuard = async ({ client, directory, worktree }, options = {
     workflow_evidence: {
       description: 'Read attested native verification records for this run and check validity against current inputs. Never executes commands.',
       args: { ids },
-      execute: async (args, context) => JSON.stringify(await guard.evidence(context.sessionID, args.ids)),
+      execute: async (args, context) => JSON.stringify(await guard.evidence(context.sessionID, args.ids, context.abort)),
     },
     workflow_checkpoint: {
       description: 'Primary fusion-planner or standalone deep-review only: save completed/blocked/stopped state. Helpers return blockers to their parent. Completed requires current passing evidence; this is not a correctness review.',
       args: { state: z.enum(['completed', 'blocked', 'stopped']), required: ids, unresolvedCount: z.number().int().nonnegative().max(10000) },
       execute: async (args, context) => {
         await owner(context);
-        return JSON.stringify(await guard.checkpoint(context.sessionID, args.state, args.required, args.unresolvedCount));
+        return JSON.stringify(await guard.checkpoint(context.sessionID, args.state, args.required, args.unresolvedCount, context.abort));
       },
     },
   } };

@@ -11,12 +11,14 @@ Pin the GitHub release in `opencode.json`, as with the cost guard:
 
 ```json
 {
-  "plugin": [["github:MRZ07/opencode-workflow-guard#v0.2.0", {"maxIdenticalFailures": 2}]]
+  "plugin": [["github:MRZ07/opencode-workflow-guard#v0.2.1", {"maxIdenticalFailures": 2}]]
 }
 ```
 
 Load it in a new OpenCode instance. Existing sessions/processes do not receive
 new hooks automatically. Keep the cost guard for financial/token limits.
+Native integration is verified on OpenCode 1.18.30. The 2.x server API differs;
+2.x activation is not verified by this release.
 
 ## Run preparation
 
@@ -89,6 +91,26 @@ errors do not count. External-path patches are not inspected or guarded.
 Dispatch counts are observed, not capped: tier budgets need explicit plan/run
 criteria that this version does not guess from prose.
 
+## Snapshot resource policy
+
+All included regular-file bytes, including game assets and native libraries,
+are SHA-256 hashed through one reusable 64 KiB buffer. Directory enumeration
+is incremental and bounded before sorting; only one file is open for hashing.
+Defaults are 512 MiB total content, 20,000 regular files, 40,000 encountered
+entries (including excluded entries), and a 60-second monotonic deadline.
+Override positive finite limits with `snapshot: {maxBytes, maxFiles, maxEntries,
+maxDurationMs}` in the plugin options. Zero is not unlimited.
+
+A budget excess, observed mutation, deadline expiry or AbortSignal cancellation
+produces no snapshot/attestation, including when pending I/O completes late.
+Deadline/cancellation checks surround awaited I/O and cleanup closes opened
+handles. They do not promise physical termination of a kernel I/O operation at
+60 seconds. All source symlinks remain rejected, including dangling links;
+fix nonportable repository config links at their owner instead of omitting them.
+File descriptor/path identity and metadata checks strengthen observed mutation
+detection; endpoint checks are not continuous-change detection or an atomic
+filesystem snapshot. Existing exclusions remain unchanged.
+
 ## Bounds and limitations
 
 - Fusion actors and `deep-review` are instrumented; unrelated agents retain their workflow.
@@ -97,7 +119,7 @@ criteria that this version does not guess from prose.
 - Source snapshots cover regular files, contents and modes; common generated,
   dependency and sensitive paths are excluded and exclusions are reported.
   Excluded/environment/remote inputs are not attested. Symlinked source,
-  unsupported file types and snapshots over 20,000 files / 128 MiB fail explicitly.
+  unsupported file types and snapshots over 20,000 files / 512 MiB fail explicitly.
 - Do not write verification inputs while checks run. Before/after snapshots
   detect changed end states, not a change temporarily applied and reverted during
   execution. Keep the existing write barrier. A zero exit does not prove test
@@ -122,5 +144,8 @@ npm run check
 npm run test:integration
 ```
 
-Integration requires an installed `opencode`; it uses an isolated configuration,
-temporary worktree and deterministic localhost model, without paid model calls.
+Integration requires the native plugin API (`/global/health`, `/config`). Set
+`OPENCODE_BIN=/absolute/path/to/opencode` when the default CLI uses another API.
+The test starts its own server with isolated configuration, a temporary worktree
+and a deterministic localhost model, without paid model calls or shared-server
+reloads.

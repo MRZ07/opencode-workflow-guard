@@ -233,7 +233,7 @@ test('prepared sibling Git worktree survives restart without granting unrelated 
   run(['worktree', 'add', '-q', '-b', 'selected', sibling]);
   await assert.rejects(verifyBefore(f.guard, 'unbound', { workdir: sibling }), /prepare.*worktree/);
   const prepared = await f.guard.prepare('root', sibling, [{ criterion: 'unit', command: 'npm test' }]);
-  assert.equal(prepared.runtime.version, '0.2.0');
+  assert.equal(prepared.runtime.version, '0.2.1');
   const restarted = createGuard(f);
   await restarted.hooks['chat.params']({ sessionID: 'child', agent: 'fusion-code-worker' });
   const input = await verifyBefore(restarted, 'selected', { workdir: sibling });
@@ -283,4 +283,60 @@ test('unchanged checks count one failing input and criteria remain independent',
   const independent = await verifyBefore(f.guard, 'other-criterion', { description: 'verify:compile Compile only' });
   await verifyAfter(f.guard, independent, 0);
   await assert.rejects(f.guard.prepare('root', f.directory, [], { criterion: 'unknown', hypothesis: 'Unknown', exitCondition: 'Stop' }, 'bad'), /declared criterion/);
+});
+
+test('cancelled evidence cannot close a completed checkpoint', async t => {
+  const f = await fixture(t);
+  const id = await verifyAfter(f.guard, await verifyBefore(f.guard));
+  const controller = new AbortController(); controller.abort();
+  assert.equal((await f.guard.evidence('root', [id], controller.signal))[0].validity, 'unavailable');
+  await assert.rejects(f.guard.checkpoint('root', 'completed', [id], 0, controller.signal), /cancelled/);
+});
+
+test('cancellation during atomic completion publication removes only its own record', async t => {
+  const f = await fixture(t);
+  const store = new Journal(path.join(f.stateDir, 'publication'));
+  await store.put('prior', { kind: 'checkpoint', state: 'blocked' });
+  const controller = new AbortController();
+  const link = fs.link;
+  t.mock.method(fs, 'link', async (...args) => { await link(...args); controller.abort(); });
+  await assert.rejects(store.put('completion', { kind: 'checkpoint', state: 'completed' }, controller.signal), /cancelled/);
+  const records = await store.records();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].state, 'blocked');
+  assert.equal((await fs.readdir(store.directory)).some(name => name.endsWith('.tmp')), false);
+});
+
+
+test('same-key publication race preserves the existing writer on cancellation', async t => {
+  const f = await fixture(t);
+  const store = new Journal(path.join(f.stateDir, 'race'));
+  await store.put('same', { kind: 'checkpoint', state: 'blocked', owner: 'first' });
+  const controller = new AbortController();
+  // Simulate a stale existence check, followed by a competing published record.
+  t.mock.method(fs, 'access', async () => { throw Object.assign(new Error('not found'), { code: 'ENOENT' }); });
+  const link = fs.link;
+  t.mock.method(fs, 'link', async (...args) => {
+    try { await link(...args); } finally { controller.abort(); }
+  });
+  await assert.rejects(store.put('same', { kind: 'checkpoint', state: 'completed', owner: 'second' }, controller.signal), /cancelled/);
+  const records = await new Journal(store.directory).records();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].owner, 'first');
+  assert.equal((await fs.readdir(store.directory)).some(name => name.endsWith('.tmp')), false);
+});
+
+
+test('cancellation during temporary cleanup cannot leave a completed checkpoint', async t => {
+  const f = await fixture(t);
+  const store = new Journal(path.join(f.stateDir, 'cleanup'));
+  const controller = new AbortController();
+  const remove = fs.rm;
+  t.mock.method(fs, 'rm', async (...args) => {
+    await remove(...args);
+    if (String(args[0]).endsWith('.tmp')) controller.abort();
+  });
+  await assert.rejects(store.put('completion', { kind: 'checkpoint', state: 'completed' }, controller.signal), /cancelled/);
+  assert.equal((await store.records()).length, 0);
+  assert.equal((await fs.readdir(store.directory)).length, 0);
 });

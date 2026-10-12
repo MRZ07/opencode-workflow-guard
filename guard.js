@@ -6,13 +6,16 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const git = promisify(execFile);
-export const VERSION = '0.2.0';
+export const VERSION = '0.2.1';
+import { snapshot } from './snapshot.js';
+export { snapshot } from './snapshot.js';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
-const excluded = new Set(['.git', '.hg', '.svn', 'node_modules', 'dist', 'build', 'target', 'coverage', '.cache', '.next', '.nuxt', '.turbo', 'screenshots', 'videos']);
-const sensitive = name => name === '.env' || name.startsWith('.env.') || /\.(pem|key|p12|pfx)$/.test(name) || ['auth.json', 'credentials', 'secrets', '.DS_Store'].includes(name);
 const within = (root, target) => target === root || target.startsWith(root + path.sep);
 const marker = description => /^verify:([A-Za-z0-9][A-Za-z0-9._-]{0,79})(?:\s|$)/.exec(description || '')?.[1];
+const checkCancellation = signal => {
+  if (signal?.aborted) throw new Error('workflow-guard: operation cancelled; no completion published');
+};
 
 // Store hashes and bounded metadata, never command output, patch text or source.
 export class Journal {
@@ -30,46 +33,30 @@ export class Journal {
     }));
     return names.map(name => this.cache.get(name));
   }
-  async put(key, value) {
+  async put(key, value, signal) {
+    checkCancellation(signal);
     const records = await this.records();
+    checkCancellation(signal);
     const filename = path.join(this.directory, hash(key) + '.json');
-    try { await fs.access(filename); return; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    try { await fs.access(filename); checkCancellation(signal); return; } catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (records.length >= this.limit) throw new Error('workflow-guard: journal capacity reached; preserve the checkpoint and inspect storage');
     const tmp = filename + '.' + process.pid + '.' + Math.random().toString(16).slice(2) + '.tmp';
-    await fs.writeFile(tmp, JSON.stringify({ ...value, version: 1 }) + '\n', { flag: 'wx', mode: 0o600 });
-    // Unique event keys and atomic publication allow replay across instances.
-    await fs.rename(tmp, filename);
-  }
-}
-
-export async function snapshot(directory, options = {}) {
-  const root = await fs.realpath(directory);
-  const entries = [];
-  let bytes = 0;
-  const skips = new Set();
-  async function walk(folder) {
-    const before = await fs.stat(folder);
-    for (const item of (await fs.readdir(folder, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
-      if (excluded.has(item.name) || sensitive(item.name)) { skips.add(item.name); continue; }
-      const absolute = path.join(folder, item.name);
-      const relative = path.relative(root, absolute).split(path.sep).join('/');
-      if (item.isSymbolicLink()) throw new Error('workflow-guard: verification input contains a symlink; use a supported checkout without source symlinks');
-      if (item.isDirectory()) await walk(absolute);
-      else if (item.isFile()) {
-        const stat = await fs.stat(absolute);
-        bytes += stat.size;
-        if (entries.length >= (options.maxFiles || 20000) || bytes > (options.maxBytes || 128 * 1024 * 1024)) throw new Error('workflow-guard: verification snapshot exceeds its bound; no verification attested');
-        const content = await fs.readFile(absolute);
-        const after = await fs.stat(absolute);
-        if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs || stat.ctimeMs !== after.ctimeMs) throw new Error('workflow-guard: inputs changed during snapshot; freeze writes before verification');
-        entries.push([relative, hash(content), stat.mode & 0o777]);
-      } else throw new Error('workflow-guard: unsupported verification input type');
+    let published = false;
+    try {
+      try {
+        await fs.writeFile(tmp, JSON.stringify({ ...value, version: 1 }) + '\n', { flag: 'wx', mode: 0o600 });
+        checkCancellation(signal);
+        // Atomically publish without overwriting another instance's same-key record.
+        try { await fs.link(tmp, filename); published = true; }
+        catch (error) { if (error.code !== 'EEXIST') throw error; }
+      } finally { await fs.rm(tmp, { force: true }); }
+      // Cleanup is part of the transaction: cancellation during it also rolls back.
+      checkCancellation(signal);
+    } catch (error) {
+      if (published && signal?.aborted) { await fs.unlink(filename); this.cache.delete(path.basename(filename)); }
+      throw error;
     }
-    const after = await fs.stat(folder);
-    if (before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) throw new Error('workflow-guard: directory changed during snapshot; freeze writes before verification');
   }
-  await walk(root);
-  return { hash: hash(JSON.stringify(entries)), files: entries.length, bytes, excluded: [...skips].sort() };
 }
 
 export function patchPaths(patch, directory) {
@@ -108,7 +95,7 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
   const roots = new Map();
   const journals = new Map();
   const rootDirectory = path.resolve(directory);
-  const runtime = { version: VERSION, optionsHash: hash(JSON.stringify({ maxIdenticalFailures, maxFailedChecks })).slice(0, 16) };
+  const runtime = { version: VERSION, optionsHash: hash(JSON.stringify({ maxIdenticalFailures, maxFailedChecks, snapshotOptions })).slice(0, 16) };
   const storage = stateDir || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'opencode', 'workflow-guard', hash(rootDirectory));
   const journal = root => {
     if (!journals.has(root)) journals.set(root, new Journal(path.join(storage, hash(root))));
@@ -138,7 +125,7 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
     if (assistant?.info?.agent) roles.set(sessionID, assistant.info.agent);
     return roles.get(sessionID);
   };
-  const snap = cwd => snapshot(cwd, snapshotOptions);
+  const snap = (cwd, signal) => snapshot(cwd, { ...snapshotOptions, ...(signal ? { signal } : {}) });
   const scopedDirectory = async (value, root) => {
     const cwd = await fs.realpath(path.resolve(rootDirectory, value || '.'));
     const base = await fs.realpath(rootDirectory);
@@ -211,7 +198,7 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
     }
     await store.put('outcome:' + input.sessionID + ':' + input.callID, result);
   }
-  async function evidence(sessionID, ids) {
+  async function evidence(sessionID, ids, signal) {
     const root = await rootOf(sessionID);
     const records = await journal(root).records();
     const snapshots = new Map();
@@ -220,7 +207,7 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
       const record = records.find(r => r.kind === 'outcome' && r.evidenceID === id);
       if (!record) { results.push({ id, validity: 'unknown', reason: 'No attested native check in this run' }); continue; }
       if (!snapshots.has(record.directory)) {
-        try { snapshots.set(record.directory, await snap(record.directory)); } catch { snapshots.set(record.directory, null); }
+        try { snapshots.set(record.directory, await snap(record.directory, signal)); } catch { snapshots.set(record.directory, null); }
       }
       const current = snapshots.get(record.directory);
       const validity = record.exit !== 0 ? 'failed' : !record.stable ? 'changed-during-check' : !current ? 'unavailable' : current.hash !== record.snapshot.hash ? 'stale' : 'pass';
@@ -315,14 +302,17 @@ export function createGuard({ client, directory, stateDir, maxIdenticalFailures 
       }
     },
   };
-  async function checkpoint(sessionID, state, required, unresolvedCount = 0) {
+  async function checkpoint(sessionID, state, required, unresolvedCount = 0, signal) {
+    checkCancellation(signal);
     const root = await rootOf(sessionID);
-    const results = await evidence(sessionID, required);
+    const results = await evidence(sessionID, required, signal);
     if (state === 'completed' && (!required.length || unresolvedCount || results.some(r => r.validity !== 'pass'))) throw new Error('workflow-guard: completion requires declared evidence passing on current inputs and zero unresolved items. Save a blocked checkpoint instead.');
     const records = await journal(root).records();
+    checkCancellation(signal);
     const report = { state, root, at: now(), runtime, unresolvedCount, evidence: results, dispatches: records.filter(r => r.kind === 'dispatch').length,
       patchFailures: records.filter(r => r.kind === 'outcome' && r.tool === 'apply_patch' && r.failed).length };
-    await journal(root).put('checkpoint:' + hash(JSON.stringify(report)), { kind: 'checkpoint', ...report });
+    await journal(root).put('checkpoint:' + hash(JSON.stringify(report)), { kind: 'checkpoint', ...report }, signal);
+    checkCancellation(signal);
     return report;
   }
   return { hooks, evidence, checkpoint, prepare, rootOf };
